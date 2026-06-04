@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <ArduinoOTA.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
@@ -24,6 +25,22 @@
 #define DEVICE_TOKEN ""
 #endif
 
+#ifndef ENABLE_OTA
+#define ENABLE_OTA 0
+#endif
+
+#ifndef OTA_HOSTNAME
+#define OTA_HOSTNAME "tnb-meter-tracker"
+#endif
+
+#ifndef OTA_PASSWORD
+#define OTA_PASSWORD ""
+#endif
+
+#ifndef PULSE_LOCKOUT_MS
+#define PULSE_LOCKOUT_MS 120
+#endif
+
 // =========================
 // USER CONFIG
 // =========================
@@ -31,16 +48,19 @@ static const char* WIFI_SSID_CFG  = WIFI_SSID;
 static const char* WIFI_PASS_CFG  = WIFI_PASS;
 static const char* SCRIPT_URL_CFG = SCRIPT_URL; // https://script.google.com/macros/s/.../exec
 static const char* DEVICE_TOKEN_CFG = DEVICE_TOKEN;
+static const char* OTA_HOSTNAME_CFG = OTA_HOSTNAME;
+static const char* OTA_PASSWORD_CFG = OTA_PASSWORD;
 
 // Meter config
 static const uint16_t IMP_PER_KWH     = 1000;   // from your meter
-static const uint32_t UPLOAD_INTERVAL = 5000;   // temporary cloud test: 5 seconds
+static const uint32_t UPLOAD_INTERVAL = 30000;  // upload every 30 seconds
 static const uint16_t DEBOUNCE_MS     = 50;     // sensor debounce
-static const uint16_t MAX_NVS_ENTRIES = 2880;   // 24h offline @ 30s (~4h at 5s)
+static const uint16_t PULSE_LOCKOUT   = PULSE_LOCKOUT_MS; // reject unrealistically fast repeats
+static const uint16_t MAX_NVS_ENTRIES = 2880;   // 24h offline @ 30s
 static const float WATTS_SCALE        = (3600.0f / (UPLOAD_INTERVAL / 1000.0f)) * 1000.0f;
 
 // Pin config
-static const uint8_t SENSOR_PIN = 4; // TCRT5000 D0 -> GPIO4
+static const uint8_t SENSOR_PIN = 4; // LDR module D0 -> GPIO4
 
 // Time config (Malaysia UTC+8)
 const char* NTP_SERVER = "pool.ntp.org";
@@ -61,16 +81,19 @@ unsigned long lastUploadMs = 0;
 unsigned long lastWifiRetryMs = 0;
 unsigned long lastNtpSyncMs = 0;
 bool wasOffline = false;
+bool otaStarted = false;
+unsigned long lastOtaProgressLogMs = 0;
 
 // =========================
 // ISR
 // =========================
 void IRAM_ATTR pulseISR() {
   uint32_t nowMs = millis();
-  if (nowMs - lastPulseMs >= DEBOUNCE_MS) {
-    pulseCount++;
-    lastPulseMs = nowMs;
-  }
+  uint32_t elapsed = nowMs - lastPulseMs;
+  if (elapsed < DEBOUNCE_MS) return;
+  if (elapsed < PULSE_LOCKOUT) return;
+  pulseCount++;
+  lastPulseMs = nowMs;
 }
 
 // =========================
@@ -130,6 +153,43 @@ void connectWiFi() {
   } else {
     Serial.println("[WiFi] Connect timeout.");
   }
+}
+
+void beginOtaIfReady() {
+#if ENABLE_OTA
+  if (otaStarted || !wifiConnected()) return;
+
+  if (hasValue(OTA_HOSTNAME_CFG)) {
+    ArduinoOTA.setHostname(OTA_HOSTNAME_CFG);
+  }
+  if (hasValue(OTA_PASSWORD_CFG)) {
+    ArduinoOTA.setPassword(OTA_PASSWORD_CFG);
+  }
+
+  ArduinoOTA.onStart([]() {
+    const char* type = (ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem";
+    Serial.printf("[OTA] Start updating %s\n", type);
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("[OTA] Update complete.");
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    unsigned long now = millis();
+    if (now - lastOtaProgressLogMs >= 1000 || progress == total) {
+      lastOtaProgressLogMs = now;
+      unsigned int percent = (total == 0) ? 0 : (progress * 100U / total);
+      Serial.printf("[OTA] Progress: %u%%\n", percent);
+    }
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("[OTA] Error[%u]\n", (unsigned int)error);
+  });
+
+  ArduinoOTA.begin();
+  otaStarted = true;
+  Serial.print("[OTA] Ready. Hostname: ");
+  Serial.println(hasValue(OTA_HOSTNAME_CFG) ? OTA_HOSTNAME_CFG : "esp32");
+#endif
 }
 
 void syncTimeIfNeeded(bool force = false) {
@@ -325,6 +385,7 @@ void setup() {
 
   // Wi-Fi + time
   connectWiFi();
+  beginOtaIfReady();
   syncTimeIfNeeded(true);
 
   // Try flush any old offline data at boot
@@ -342,6 +403,14 @@ void loop() {
     lastWifiRetryMs = millis();
     connectWiFi();
   }
+
+  beginOtaIfReady();
+
+#if ENABLE_OTA
+  if (otaStarted) {
+    ArduinoOTA.handle();
+  }
+#endif
 
   // Sync NTP periodically
   syncTimeIfNeeded(false);
